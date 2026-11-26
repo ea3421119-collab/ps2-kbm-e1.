@@ -1,0 +1,25 @@
+# Compila el homebrew E1 v2 en los servidores de GitHub (no necesitas computadora).
+# SIN PROBAR: escrito siguiendo los workflows de OPL y SDL (contenedor ps2dev). Si falla, copia el log del paso que falle.
+name: build-e1
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  e1:
+    runs-on: ubuntu-latest
+    container: ghcr.io/ps2homebrew/ps2homebrew:main
+    # alternativa si esa imagen falla: container: ps2dev/ps2dev:latest   (en ese caso anade un paso: apk add build-base git)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Entorno (diagnostico)
+        run: |
+          echo "PS2DEV=$PS2DEV"; echo "PS2SDK=$PS2SDK"
+          ls "$PS2SDK/iop/irx" | head -50
+          ls "$PS2SDK/samples" | head
+      - name: Compilar E1 v2
+        run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usbinput-e1-v2
+          path: usbinput.elf
+          
