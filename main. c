@@ -1,0 +1,332 @@
+/*
+ * ps2-usb-input-test  (etapa E1 del mod de teclado+mouse para GTA SA PS2)  -- v2
+ * v2: ver CHANGES.md (guardas anti-cuelgue, contadores de repeticion y de saltos grandes del mouse)
+ *
+ * Homebrew independiente. NO toca GTA San Andreas.
+ * Objetivo: comprobar en PCSX2 y en una PS2 Slim real que podemos leer a la vez
+ *   - un teclado USB (modo RAW: estado + codigo HID)
+ *   - un mouse USB (modo DIFF: desplazamientos relativos + botones + rueda)
+ * y observar conexion/desconexion.
+ *
+ * Solo usa APIs de PS2SDK que se revisaron en su repositorio / documentacion:
+ *   libkbd.h : PS2KbdInit, PS2KbdSetReadmode, PS2KbdReadRaw (+ ps2kbd.h)
+ *   libmouse.h: PS2MouseInit, PS2MouseSetReadMode, PS2MouseRead, PS2MouseEnum,
+ *               PS2MouseReset, PS2MouseGetReadMode/GetAccel/GetThres (+ ps2mouse.h)
+ *   sbv_patches.h, iopcontrol.h, loadfile.h, iopheap.h, sifrpc.h, debug.h
+ *
+ * NO COMPILADO NI EJECUTADO por el autor de este archivo (no habia toolchain en
+ * el entorno donde se escribio). Ver README.md.
+ */
+
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <tamtypes.h>
+#include <kernel.h>
+#include <sifrpc.h>
+#include <loadfile.h>
+#include <iopcontrol.h>
+#include <iopheap.h>
+#include <sbv_patches.h>
+#include <debug.h>
+#include <libkbd.h>
+#include <libmouse.h>
+
+/* IRX incrustados (generados por bin2c desde $PS2SDK/iop/irx/ (usbd, ps2kbd, ps2mouse)) */
+extern unsigned char usbd_irx[];
+extern unsigned int size_usbd_irx;
+extern unsigned char ps2kbd_irx[];
+extern unsigned int size_ps2kbd_irx;
+extern unsigned char ps2mouse_irx[];
+extern unsigned int size_ps2mouse_irx;
+
+/* ---------- estado ---------- */
+#define LOG_LINES 14
+#define LOG_W     80
+
+static char logbuf[LOG_LINES][LOG_W];
+static int  log_head;
+static unsigned loop_no;
+
+static u8       key_down[256];
+static unsigned key_events;
+static unsigned key_repeat_downs, key_unmatched_up;   /* v2: DOWN repetido sin UP / UP sin DOWN */
+
+static unsigned mouse_reads;
+static int  last_x, last_y, last_w;
+static int  sum_x, sum_y, sum_w;
+static int  max_abs_x, max_abs_y;
+static unsigned mouse_nonzero_reads, mouse_big_moves; /* v2: lecturas con movimiento / |d|>=100 */
+static unsigned mouse_buttons, prev_buttons;
+static unsigned mouse_enum, prev_enum = 0xFFFFFFFFu;
+
+static int rc_patch_lmb, rc_patch_fio;
+static int id_usbd, id_kbd, id_mouse, res_usbd, res_kbd, res_mouse;
+static int rc_kbd_init = -99, rc_kbd_mode = -99;
+static int rc_mouse_init = -99, rc_mouse_mode = -99;
+static unsigned mouse_readmode, mouse_thres;
+static int mouse_accel_x1000;
+
+static int dirty = 1;
+
+/* ---------- utilidades ---------- */
+static void log_event(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(logbuf[log_head], LOG_W, fmt, ap);
+    va_end(ap);
+    log_head = (log_head + 1) % LOG_LINES;
+    dirty = 1;
+}
+
+static void put_line(int y, const char *fmt, ...)
+{
+    char tmp[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    scr_setXY(0, y);
+    scr_printf("%-78.78s\n", tmp);
+}
+
+/* Nombre (parcial) de codigos de uso HID (USB HID Usage Tables, pagina Keyboard). */
+static const char *hid_name(u8 k, char *buf)
+{
+    if (k >= 0x04 && k <= 0x1D) { buf[0] = 'A' + (k - 0x04); buf[1] = 0; return buf; }
+    if (k >= 0x1E && k <= 0x26) { buf[0] = '1' + (k - 0x1E); buf[1] = 0; return buf; }
+    switch (k) {
+    case 0x27: return "0";
+    case 0x28: return "Enter";
+    case 0x29: return "Esc";
+    case 0x2A: return "Bksp";
+    case 0x2B: return "Tab";
+    case 0x2C: return "Space";
+    case 0x3A: return "F1";
+    case 0x3B: return "F2";
+    case 0x4F: return "Right";
+    case 0x50: return "Left";
+    case 0x51: return "Down";
+    case 0x52: return "Up";
+    case 0xE0: return "LCtrl";
+    case 0xE1: return "LShift";
+    case 0xE2: return "LAlt";
+    case 0xE4: return "RCtrl";
+    case 0xE5: return "RShift";
+    case 0xE6: return "RAlt";
+    default:   return "?";
+    }
+}
+
+static int load_irx(const char *name, void *buf, unsigned size, int *modres)
+{
+    int ret = 0;
+    int id = SifExecModuleBuffer(buf, size, 0, NULL, &ret);
+    *modres = ret;
+    scr_printf("  %-10s id=%d modres=%d\n", name, id, ret);
+    return id;
+}
+
+static void try_init_kbd(void)
+{
+    if (id_usbd < 0 || id_kbd < 0) { rc_kbd_init = -98; return; }   /* v2: IRX no cargado -> no llamar */
+    rc_kbd_init = PS2KbdInit();               /* 1=ok, 2=ya iniciado, 0=fallo (libkbd.c) */
+    if (rc_kbd_init > 0)
+        rc_kbd_mode = PS2KbdSetReadmode(PS2KBD_READMODE_RAW);
+}
+
+static void try_init_mouse(void)
+{
+    if (id_usbd < 0 || id_mouse < 0) { rc_mouse_init = -98; return; }   /* v2: evita el cuelgue posible de PS2MouseInit */
+    rc_mouse_init = PS2MouseInit();           /* 1=ok, 0=ya iniciado, -1=fallo (libmouse.c) */
+    if (rc_mouse_init >= 0) {
+        rc_mouse_mode = PS2MouseSetReadMode(PS2MOUSE_READMODE_DIFF);
+        mouse_readmode = PS2MouseGetReadMode();
+        mouse_thres = PS2MouseGetThres();
+        mouse_accel_x1000 = (int)(PS2MouseGetAccel() * 1000.0f);
+    }
+}
+
+/* ---------- lectura ---------- */
+static void poll_keyboard(void)
+{
+    PS2KbdRawKey k;
+    char nb[2];
+
+    if (rc_kbd_init <= 0)
+        return;
+    while (PS2KbdReadRaw(&k) > 0) {
+        key_events++;
+        if (k.state == PS2KBD_RAWKEY_DOWN) {
+            if (key_down[k.key]) key_repeat_downs++;
+            key_down[k.key] = 1;
+            log_event("[%06u] KEY DOWN 0x%02X %s", loop_no, k.key, hid_name(k.key, nb));
+            if (k.key == 0x3A) {              /* F1: limpiar contadores */
+                sum_x = sum_y = sum_w = 0;
+                max_abs_x = max_abs_y = 0;
+                mouse_reads = 0;
+                key_events = 0;
+                key_repeat_downs = key_unmatched_up = 0;
+                mouse_nonzero_reads = mouse_big_moves = 0;
+                log_event("[%06u] contadores a cero", loop_no);
+            } else if (k.key == 0x3B) {       /* F2: PS2MouseReset (experimental) */
+                int r = PS2MouseReset();
+                log_event("[%06u] PS2MouseReset() -> %d", loop_no, r);
+            }
+        } else if (k.state == PS2KBD_RAWKEY_UP) {
+            if (!key_down[k.key]) key_unmatched_up++;
+            key_down[k.key] = 0;
+            log_event("[%06u] KEY UP   0x%02X %s", loop_no, k.key, hid_name(k.key, nb));
+        } else {
+            log_event("[%06u] KEY state=0x%02X key=0x%02X (estado desconocido)",
+                      loop_no, k.state, k.key);
+        }
+        dirty = 1;
+    }
+}
+
+static void poll_mouse(void)
+{
+    PS2MouseData m;
+    int ax, ay;
+
+    if (rc_mouse_init < 0)
+        return;
+    if (PS2MouseRead(&m) > 0) {
+        mouse_reads++;
+        last_x = m.x; last_y = m.y; last_w = m.wheel;
+        mouse_buttons = m.buttons;
+        sum_x += m.x; sum_y += m.y; sum_w += m.wheel;
+        ax = m.x < 0 ? -m.x : m.x;
+        ay = m.y < 0 ? -m.y : m.y;
+        if (ax > max_abs_x) max_abs_x = ax;
+        if (ay > max_abs_y) max_abs_y = ay;
+        if (m.x || m.y || m.wheel) {
+            dirty = 1;
+            mouse_nonzero_reads++;
+        }
+        if (ax >= 100 || ay >= 100)
+            mouse_big_moves++;
+        if (mouse_buttons != prev_buttons) {
+            log_event("[%06u] MOUSE BTN raw=0x%08X (L=%d R=%d M=%d)", loop_no, mouse_buttons,
+                      !!(mouse_buttons & PS2MOUSE_BTN1), !!(mouse_buttons & PS2MOUSE_BTN2),
+                      !!(mouse_buttons & PS2MOUSE_BTN3));
+            prev_buttons = mouse_buttons;
+        }
+        if (m.wheel)
+            log_event("[%06u] MOUSE WHEEL %d", loop_no, (int)m.wheel);
+    }
+    if ((loop_no % 30) == 0) {
+        mouse_enum = PS2MouseEnum();
+        if (mouse_enum != prev_enum) {
+            log_event("[%06u] MOUSE ENUM 0x%08X -> 0x%08X", loop_no, prev_enum, mouse_enum);
+            prev_enum = mouse_enum;
+        }
+    }
+}
+
+/* ---------- pantalla (80x40 caracteres, debug screen de PS2SDK) ---------- */
+static void draw(void)
+{
+    char nb[2], list[160], one[24];
+    int i, n = 0;
+
+    list[0] = 0;
+    for (i = 0; i < 256; i++) {
+        if (!key_down[i]) continue;
+        n++;
+        snprintf(one, sizeof(one), "0x%02X(%s) ", i, hid_name((u8)i, nb));
+        if (strlen(list) + strlen(one) < sizeof(list) - 1)
+            strcat(list, one);
+    }
+
+    put_line(0, "PS2 USB INPUT TEST (E1 v2)  teclado + mouse   loop=%u", loop_no);
+    put_line(1, "irx id: usbd=%d kbd=%d mouse=%d | patch lmb=%d fio=%d | modres %d/%d/%d",
+             id_usbd, id_kbd, id_mouse, rc_patch_lmb, rc_patch_fio, res_usbd, res_kbd, res_mouse);
+    put_line(2, "KbdInit=%d SetMode(RAW)=%d | MouseInit=%d SetMode(DIFF)=%d",
+             rc_kbd_init, rc_kbd_mode, rc_mouse_init, rc_mouse_mode);
+    put_line(3, "mouse readmode=%u accel*1000=%d thres=%u enum=0x%08X",
+             mouse_readmode, mouse_accel_x1000, mouse_thres, mouse_enum);
+
+    put_line(5, "TECLADO  eventos=%u  ahora=%d  DOWNrep=%u UPhuerfano=%u", key_events, n,
+             key_repeat_downs, key_unmatched_up);
+    put_line(6, "%.76s", list);
+    put_line(7, "%s", strlen(list) > 76 ? &list[76] : "");
+
+    put_line(9,  "MOUSE    lecturas=%u  conMov=%u  |d|>=100: %u", mouse_reads, mouse_nonzero_reads,
+             mouse_big_moves);
+    put_line(10, "ultimo   dx=%d dy=%d rueda=%d", last_x, last_y, last_w);
+    put_line(11, "suma     x=%d y=%d rueda=%d  max|dx|=%d max|dy|=%d",
+             sum_x, sum_y, sum_w, max_abs_x, max_abs_y);
+    put_line(12, "botones  raw=0x%08X  izq=%d der=%d medio=%d", mouse_buttons,
+             !!(mouse_buttons & PS2MOUSE_BTN1), !!(mouse_buttons & PS2MOUSE_BTN2),
+             !!(mouse_buttons & PS2MOUSE_BTN3));
+
+    put_line(14, "LOG (el mas nuevo abajo)");
+    for (i = 0; i < LOG_LINES; i++)
+        put_line(15 + i, "%s", logbuf[(log_head + i) % LOG_LINES]);
+
+    put_line(30, "F1: borrar contadores | F2: PS2MouseReset() (experimental)");
+    put_line(31, "Hot-plug: desconecta/conecta y mira 'enum' y el LOG.");
+    put_line(32, "ps2kbd no expone evento de conexion; ver README.");
+}
+
+/* ---------- main ---------- */
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    /* Secuencia de arranque tomada de ejemplos de ps2sdk / OPL / SDL-PS2 */
+    SifInitRpc(0);
+    while (!SifIopReset("", 0)) { }
+    while (!SifIopSync()) { }
+    SifInitRpc(0);
+    SifLoadFileInit();
+    SifInitIopHeap();
+    rc_patch_lmb = sbv_patch_enable_lmb();
+    rc_patch_fio = sbv_patch_fileio();
+
+    init_scr();
+    sleep(1);                      /* init_scr puede perder las primeras lineas si se imprime enseguida */
+    scr_printf("ps2-usb-input-test E1\nCargando modulos IOP...\n");
+    scr_printf("  patch_enable_lmb=%d patch_fileio=%d\n", rc_patch_lmb, rc_patch_fio);
+
+    id_usbd  = load_irx("usbd",     usbd_irx,     size_usbd_irx,     &res_usbd);
+    id_kbd   = load_irx("ps2kbd",   ps2kbd_irx,   size_ps2kbd_irx,   &res_kbd);
+    id_mouse = load_irx("ps2mouse", ps2mouse_irx, size_ps2mouse_irx, &res_mouse);
+
+    scr_printf("PS2KbdInit()...\n");
+    try_init_kbd();
+    scr_printf("  -> %d (mode RAW -> %d)\n", rc_kbd_init, rc_kbd_mode);
+
+    /* OJO: segun libmouse.c, PS2MouseInit puede quedarse en bucle si el bind RPC
+       tiene exito pero el servidor no aparece (p.ej. ps2mouse.irx no arranco). */
+    scr_printf("PS2MouseInit()... (si se cuelga aqui, ps2mouse.irx no arranco)\n");
+    try_init_mouse();
+    scr_printf("  -> %d (mode DIFF -> %d)\n", rc_mouse_init, rc_mouse_mode);
+
+    sleep(2);
+    scr_clear();
+
+    for (;;) {
+        loop_no++;
+
+        /* reintentos si no habia dispositivo al arrancar */
+        if ((loop_no % 120) == 0) {
+            if (rc_kbd_init <= 0) { try_init_kbd();   dirty = 1; }
+            if (rc_mouse_init < 0) { try_init_mouse(); dirty = 1; }
+        }
+
+        poll_keyboard();
+        poll_mouse();
+
+        if (dirty || (loop_no % 60) == 0) {
+            draw();
+            dirty = 0;
+        }
+    }
+    return 0;
+}
